@@ -1,0 +1,56 @@
+"use client";
+
+import * as React from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { WagmiProvider, createConfig, http } from "wagmi";
+import { sepolia } from "wagmi/chains";
+import { injected, walletConnect } from "wagmi/connectors";
+
+const queryClient = new QueryClient();
+
+const sepoliaRpcUrl = process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL;
+if (!sepoliaRpcUrl) {
+  throw new Error("Missing env var NEXT_PUBLIC_SEPOLIA_RPC_URL");
+}
+
+const wcProjectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID;
+
+const connectors = [
+  // MetaMask
+  injected({ target: "metaMask", shimDisconnect: true }),
+
+  // Rabby
+  injected({ target: "rabby", shimDisconnect: true }),
+
+  ...(wcProjectId
+    ? [
+        walletConnect({
+          projectId: wcProjectId,
+          showQrModal: true,
+          metadata: {
+            name: "DEX8004",
+            description: "ERC-8004 Agents Explorer Demo",
+            url: "http://localhost:3000",
+            icons: ["http://localhost:3000/favicon.ico"],
+          },
+        }),
+      ]
+    : []),
+];
+
+export const wagmiConfig = createConfig({
+  chains: [sepolia],
+  connectors,
+  transports: {
+    [sepolia.id]: http(sepoliaRpcUrl),
+  },
+  ssr: true,
+});
+
+export function Web3Provider({ children }: { children: React.ReactNode }) {
+  return (
+    <WagmiProvider config={wagmiConfig}>
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    </WagmiProvider>
+  );
+}

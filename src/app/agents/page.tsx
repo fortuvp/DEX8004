@@ -1,0 +1,503 @@
+﻿"use client";
+
+import { useState, useEffect, useMemo, useCallback, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+    Search,
+    ChevronLeft,
+    ChevronRight,
+    Loader2,
+    Database,
+    Rows3,
+    LayoutGrid,
+} from "lucide-react";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
+import { AgentCard } from "@/components/agents/agent-card";
+import type { Agent } from "@/types/agent";
+import { truncateAddress, getDisplayName, formatDate } from "@/lib/format";
+import { getAddressExplorerUrl, getAddressExplorerUrlForNetwork } from "@/lib/block-explorer";
+import { useRealityQuestions } from "@/lib/reality/use-questions";
+import { parseAgentIdFromQuestionText } from "@/lib/reality/abuse-flags";
+import {
+    AGENT_SUBGRAPH_NETWORKS,
+    getAgentChainLabel,
+    getAgentSubgraphLabel,
+    isAgentSubgraphNetwork,
+    type AgentSubgraphNetwork,
+} from "@/lib/agent-networks";
+
+type AgentTrustSignals = {
+    collateralized: boolean;
+};
+
+function getAgentIdVariants(value: string): Set<string> {
+    const normalized = value.trim().toLowerCase();
+    const short = normalized.split(":").pop() || normalized;
+    return new Set([normalized, short]);
+}
+
+function matchesReportedAgent(questionText: string, agentId: string) {
+    const parsedAgentId = parseAgentIdFromQuestionText(questionText);
+    if (!parsedAgentId) return false;
+    const variants = getAgentIdVariants(agentId);
+    const parsedVariants = getAgentIdVariants(parsedAgentId);
+    for (const parsed of parsedVariants) {
+        if (variants.has(parsed)) return true;
+    }
+    return false;
+}
+
+export default function AgentsPage() {
+    return (
+        <Suspense fallback={<AgentsLoading />}>
+            <AgentsContent />
+        </Suspense>
+    );
+}
+
+function AgentsLoading() {
+    return (
+        <div className="container mx-auto px-6 py-10 max-w-7xl">
+            <div className="flex items-center justify-center h-64">
+                <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+            </div>
+        </div>
+    );
+}
+
+function AgentsContent() {
+    const router = useRouter();
+    const realityQuestions = useRealityQuestions();
+    const searchParams = useSearchParams();
+    const initialQuery = searchParams.get("q") || "";
+    const initialNetworkParam = searchParams.get("network");
+    const initialNetwork: AgentSubgraphNetwork = isAgentSubgraphNetwork(initialNetworkParam)
+        ? initialNetworkParam
+        : "sepolia";
+
+    const [agents, setAgents] = useState<Agent[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [searchQuery, setSearchQuery] = useState(initialQuery);
+    const [network, setNetwork] = useState<AgentSubgraphNetwork>(initialNetwork);
+    const [sortBy, setSortBy] = useState("createdAt:desc");
+    const [protocolFilter, setProtocolFilter] = useState("all");
+    const [currentPage, setCurrentPage] = useState(1);
+    const [hasMore, setHasMore] = useState(false);
+    const [perPage, setPerPage] = useState("12");
+    const [viewMode, setViewMode] = useState<"list" | "card">("list");
+    const [collateralFilter, setCollateralFilter] = useState<"all" | "collateralized" | "notCollateralized">("all");
+    const [reportFilter, setReportFilter] = useState<"all" | "reported" | "nonReported">("all");
+    const [trustByKey, setTrustByKey] = useState<Record<string, AgentTrustSignals>>({});
+    const [trustLoading, setTrustLoading] = useState(false);
+
+    const fetchAgents = useCallback(async (page: number = 1, query?: string) => {
+        setIsLoading(true);
+        const searchTerm = query !== undefined ? query : searchQuery;
+        const isReportWideFetch = reportFilter !== "all";
+        const requestedPage = isReportWideFetch ? 1 : page;
+        const requestedPageSize = isReportWideFetch ? "300" : perPage;
+        try {
+            const params = new URLSearchParams({
+                page: requestedPage.toString(),
+                pageSize: requestedPageSize,
+                sort: sortBy,
+                network,
+            });
+            if (searchTerm) params.set("q", searchTerm);
+            if (protocolFilter !== "all") params.set("protocol", protocolFilter);
+
+            const response = await fetch(`/api/agents?${params}`);
+            const data = await response.json();
+
+            if (data.success) {
+                setAgents(data.items);
+                setHasMore(isReportWideFetch ? false : data.hasMore);
+                setCurrentPage(requestedPage);
+            }
+        } catch (error) {
+            console.error("Failed to fetch agents:", error);
+        } finally {
+            setIsLoading(false);
+        }
+    }, [searchQuery, perPage, sortBy, protocolFilter, network, reportFilter]);
+
+    useEffect(() => {
+        fetchAgents(1, searchQuery);
+    }, [fetchAgents, searchQuery]);
+
+    useEffect(() => {
+        let cancelled = false;
+        async function hydrateTrustSignals() {
+            if (!agents.length) {
+                setTrustByKey({});
+                return;
+            }
+
+            setTrustLoading(true);
+            try {
+                const updates = await Promise.all(
+                    agents.map(async (agent) => {
+                        const key = `${network}:${agent.agentId.toLowerCase()}`;
+
+                        try {
+                            const res = await fetch(
+                                `/api/kleros/verification?agentId=${encodeURIComponent(agent.agentId)}&network=${encodeURIComponent(network)}`,
+                                { cache: "no-store" }
+                            );
+                            const json = await res.json();
+                            const collateralized = Boolean(json?.success && json?.itemID);
+                            return [key, { collateralized }] as const;
+                        } catch {
+                            return [key, { collateralized: false }] as const;
+                        }
+                    })
+                );
+
+                if (cancelled) return;
+                const next: Record<string, AgentTrustSignals> = {};
+                for (const [key, value] of updates) next[key] = value;
+                setTrustByKey(next);
+            } finally {
+                if (!cancelled) setTrustLoading(false);
+            }
+        }
+
+        void hydrateTrustSignals();
+        return () => {
+            cancelled = true;
+        };
+    }, [agents, network]);
+
+    const reportedByKey = useMemo(() => {
+        const next: Record<string, boolean> = {};
+        for (const agent of agents) {
+            const key = `${network}:${agent.agentId.toLowerCase()}`;
+            next[key] = realityQuestions.data.some((q) => matchesReportedAgent(q.question, String(agent.agentId)));
+        }
+        return next;
+    }, [agents, network, realityQuestions.data]);
+
+    const filteredAgents = agents.filter((agent) => {
+        const key = `${network}:${agent.agentId.toLowerCase()}`;
+        const trust = trustByKey[key];
+        const reported = reportedByKey[key] || false;
+
+        if (collateralFilter === "collateralized" && trust?.collateralized !== true) return false;
+        if (collateralFilter === "notCollateralized" && trust?.collateralized !== false) return false;
+        if (reportFilter === "reported" && !reported) return false;
+        if (reportFilter === "nonReported" && reported) return false;
+
+        return true;
+    });
+
+    const handleSearch = () => fetchAgents(1, searchQuery);
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === "Enter") handleSearch();
+    };
+
+    return (
+        <div className="container mx-auto px-6 py-10 max-w-7xl">
+            <div className="mb-8">
+                <div className="flex items-center gap-3 mb-2">
+                    <Database className="h-6 w-6 text-primary" />
+                    <h1 className="text-3xl font-bold tracking-tight">Agent Registry</h1>
+                </div>
+                <p className="text-muted-foreground">
+                    Discover and explore autonomous agents on the ERC-8004 registry
+                </p>
+            </div>
+
+            <div className="rounded-xl border border-border/50 bg-card/50 backdrop-blur-sm p-4 mb-6">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-center">
+                    <div className="relative flex-1">
+                        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                        <input
+                            type="text"
+                            placeholder="Search by name or agent ID..."
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            onKeyDown={handleKeyDown}
+                            className="h-11 w-full rounded-lg border border-border/50 bg-background pl-10 pr-4 text-sm placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
+                        />
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                        <Select value={sortBy} onValueChange={setSortBy}>
+                            <SelectTrigger className="w-[160px] h-11">
+                                <SelectValue placeholder="Sort by" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="createdAt:desc">Newest</SelectItem>
+                                <SelectItem value="updatedAt:desc">Last Updated</SelectItem>
+                                <SelectItem value="lastActivity:desc">Most Active</SelectItem>
+                                <SelectItem value="totalFeedback:desc">Most Feedback</SelectItem>
+                            </SelectContent>
+                        </Select>
+
+                        <Select
+                            value={network}
+                            onValueChange={(value) => {
+                                if (isAgentSubgraphNetwork(value)) setNetwork(value);
+                            }}
+                        >
+                            <SelectTrigger className="w-[150px] h-11">
+                                <SelectValue placeholder="Chain" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                {AGENT_SUBGRAPH_NETWORKS.map((networkKey) => (
+                                    <SelectItem key={networkKey} value={networkKey}>
+                                        {getAgentSubgraphLabel(networkKey)}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+
+                        <Select value={protocolFilter} onValueChange={setProtocolFilter}>
+                            <SelectTrigger className="w-[130px] h-11">
+                                <SelectValue placeholder="Protocol" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="all">All Protocols</SelectItem>
+                                <SelectItem value="mcp">MCP</SelectItem>
+                                <SelectItem value="a2a">A2A</SelectItem>
+                            </SelectContent>
+                        </Select>
+
+                        <Select
+                            value={collateralFilter}
+                            onValueChange={(value: "all" | "collateralized" | "notCollateralized") => setCollateralFilter(value)}
+                        >
+                            <SelectTrigger className="w-[170px] h-11">
+                                <SelectValue placeholder="Collateral" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="all">All collateral</SelectItem>
+                                <SelectItem value="collateralized">Collateralized only</SelectItem>
+                                <SelectItem value="notCollateralized">Not collateralized</SelectItem>
+                            </SelectContent>
+                        </Select>
+
+                        <Select
+                            value={reportFilter}
+                            onValueChange={(value: "all" | "reported" | "nonReported") => setReportFilter(value)}
+                        >
+                            <SelectTrigger className="w-[170px] h-11">
+                                <SelectValue placeholder="Reports" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="all">All reports</SelectItem>
+                                <SelectItem value="reported">Reported</SelectItem>
+                                <SelectItem value="nonReported">Non reported</SelectItem>
+                            </SelectContent>
+                        </Select>
+
+                        <div className="inline-flex items-center rounded-lg border border-border/50 bg-background/50 p-1">
+                            <Button
+                                type="button"
+                                size="sm"
+                                variant={viewMode === "list" ? "secondary" : "ghost"}
+                                className="h-9 px-3"
+                                onClick={() => setViewMode("list")}
+                            >
+                                <Rows3 className="mr-1.5 h-4 w-4" />
+                                List
+                            </Button>
+                            <Button
+                                type="button"
+                                size="sm"
+                                variant={viewMode === "card" ? "secondary" : "ghost"}
+                                className="h-9 px-3"
+                                onClick={() => setViewMode("card")}
+                            >
+                                <LayoutGrid className="mr-1.5 h-4 w-4" />
+                                Card
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {viewMode === "list" ? (
+                <div className="rounded-xl border border-border/50 overflow-hidden bg-card/30 backdrop-blur-sm">
+                    <Table>
+                        <TableHeader>
+                                <TableRow className="hover:bg-transparent border-border/50">
+                                    <TableHead className="w-[300px] font-semibold">Name</TableHead>
+                                    <TableHead className="text-center font-semibold">Collateralized</TableHead>
+                                    <TableHead className="font-semibold">Chain</TableHead>
+                                    <TableHead className="font-semibold">Owner</TableHead>
+                                    <TableHead className="font-semibold">Created</TableHead>
+                                </TableRow>
+                            </TableHeader>
+                        <TableBody>
+                            {isLoading ? (
+                                <TableRow>
+                                    <TableCell colSpan={5} className="h-32 text-center">
+                                        <Loader2 className="mx-auto h-6 w-6 animate-spin text-muted-foreground" />
+                                    </TableCell>
+                                </TableRow>
+                            ) : filteredAgents.length === 0 ? (
+                                <TableRow>
+                                    <TableCell colSpan={5} className="h-32 text-center text-muted-foreground">
+                                        No agents found
+                                    </TableCell>
+                                </TableRow>
+                            ) : (
+                                filteredAgents.map((agent) => {
+                                    const ownerExplorerUrl =
+                                        getAddressExplorerUrl(agent.owner, agent.chainId) ||
+                                        getAddressExplorerUrlForNetwork(agent.owner, network);
+                                    const trust = trustByKey[`${network}:${agent.agentId.toLowerCase()}`];
+                                    const agentHref = `/agents/${encodeURIComponent(agent.id)}?network=${network}`;
+
+                                    return (
+                                        <TableRow
+                                            key={agent.id}
+                                            className="cursor-pointer border-border/30 transition-colors hover:bg-muted/30"
+                                            role="link"
+                                            tabIndex={0}
+                                            onClick={() => router.push(agentHref)}
+                                            onKeyDown={(event) => {
+                                                if (event.key === "Enter" || event.key === " ") {
+                                                    event.preventDefault();
+                                                    router.push(agentHref);
+                                                }
+                                            }}
+                                        >
+                                            <TableCell>
+                                                <div className="flex items-center gap-3">
+                                                    <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted overflow-hidden shrink-0">
+                                                        {agent.registrationFile?.image ? (
+                                                            <img
+                                                                src={agent.registrationFile.image}
+                                                                alt={getDisplayName(agent)}
+                                                                className="h-9 w-9 object-cover"
+                                                            />
+                                                        ) : (
+                                                            <span className="text-sm">AI</span>
+                                                        )}
+                                                    </div>
+                                                    <div className="min-w-0">
+                                                        <span className="font-medium truncate block max-w-[200px]">
+                                                            {getDisplayName(agent)}
+                                                        </span>
+                                                        {agent.registrationFile?.description && (
+                                                            <span className="text-xs text-muted-foreground truncate block max-w-[200px]">
+                                                                {agent.registrationFile.description.slice(0, 40)}...
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            </TableCell>
+                                            <TableCell className="text-center">
+                                                {trustLoading && !trust ? (
+                                                    <span className="text-muted-foreground">...</span>
+                                                ) : trust?.collateralized ? (
+                                                    <Badge className="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">Yes</Badge>
+                                                ) : (
+                                                    <Badge variant="outline" className="text-muted-foreground">No</Badge>
+                                                )}
+                                            </TableCell>
+                                            <TableCell>
+                                                <Badge
+                                                    variant="outline"
+                                                    className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20 font-medium"
+                                                >
+                                                    {getAgentChainLabel(agent.chainId, network)}
+                                                </Badge>
+                                            </TableCell>
+                                            <TableCell>
+                                                {ownerExplorerUrl ? (
+                                                    <a
+                                                        href={ownerExplorerUrl}
+                                                        target="_blank"
+                                                        rel="noreferrer"
+                                                        className="font-mono text-sm text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
+                                                        onClick={(event) => event.stopPropagation()}
+                                                    >
+                                                        {truncateAddress(agent.owner)}
+                                                    </a>
+                                                ) : (
+                                                    <span className="font-mono text-sm text-muted-foreground">
+                                                        {truncateAddress(agent.owner)}
+                                                    </span>
+                                                )}
+                                            </TableCell>
+                                            <TableCell>
+                                                <span className="text-sm text-muted-foreground">
+                                                    {formatDate(agent.createdAt)}
+                                                </span>
+                                            </TableCell>
+                                        </TableRow>
+                                    );
+                                })
+                            )}
+                        </TableBody>
+                    </Table>
+                </div>
+            ) : (
+                <div className="rounded-xl border border-border/50 bg-card/30 p-4 backdrop-blur-sm">
+                    {isLoading ? (
+                        <div className="flex h-32 items-center justify-center">
+                            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                        </div>
+                    ) : filteredAgents.length === 0 ? (
+                        <div className="flex h-32 items-center justify-center text-muted-foreground">No agents found</div>
+                    ) : (
+                        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                            {filteredAgents.map((agent) => (
+                                <AgentCard key={agent.id} agent={agent} network={network} />
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
+
+            <div className="mt-6 flex flex-col items-center justify-between gap-4 sm:flex-row">
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <span>Showing {filteredAgents.length} of {agents.length} agents</span>
+                    <span className="text-border">|</span>
+                    <span>Per page:</span>
+                    <Select value={perPage} onValueChange={setPerPage}>
+                        <SelectTrigger className="h-8 w-[70px]">
+                            <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                            <SelectItem value="12">12</SelectItem>
+                            <SelectItem value="24">24</SelectItem>
+                            <SelectItem value="48">48</SelectItem>
+                        </SelectContent>
+                    </Select>
+                </div>
+
+                <div className="flex items-center gap-2">
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={currentPage === 1 || reportFilter !== "all"}
+                        onClick={() => fetchAgents(currentPage - 1)}
+                        className="rounded-lg"
+                    >
+                        <ChevronLeft className="h-4 w-4 mr-1" />
+                        Previous
+                    </Button>
+                    <span className="px-3 text-sm text-muted-foreground">Page {currentPage}</span>
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={!hasMore || reportFilter !== "all"}
+                        onClick={() => fetchAgents(currentPage + 1)}
+                        className="rounded-lg"
+                    >
+                        Next
+                        <ChevronRight className="h-4 w-4 ml-1" />
+                    </Button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
