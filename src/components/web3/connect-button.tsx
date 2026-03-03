@@ -11,6 +11,24 @@ import { getAddressExplorerUrl } from "@/lib/block-explorer";
 
 type WalletKind = "metamask" | "rabby" | "walletconnect";
 
+const walletConnectProjectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID;
+
+const WALLET_ICON_URLS: Record<WalletKind, string | null> = {
+  metamask: walletConnectProjectId
+    ? `https://explorer-api.walletconnect.com/v3/logo/md/eebe4a7f-7166-402f-92e0-1f64ca2aa800?projectId=${walletConnectProjectId}`
+    : null,
+  rabby: walletConnectProjectId
+    ? `https://explorer-api.walletconnect.com/v3/logo/md/255e6ba2-8dfd-43ad-e88e-57cbb98f6800?projectId=${walletConnectProjectId}`
+    : "https://raw.githubusercontent.com/RabbyHub/logo/master/logo.svg",
+  walletconnect: "https://cdn.sanity.io/files/1t8iva7t/production/0e5e20646c3067b55046c65e1000ed4a3b28f596.svg",
+};
+
+const WALLET_LABELS: Record<WalletKind, string> = {
+  metamask: "MetaMask",
+  rabby: "Rabby",
+  walletconnect: "WalletConnect",
+};
+
 function getChainLabel(chainId: number | undefined) {
   if (!chainId) return "Unknown";
   if (chainId === sepolia.id) return "Sepolia";
@@ -18,6 +36,24 @@ function getChainLabel(chainId: number | undefined) {
 }
 
 function WalletLogo({ kind }: { kind: WalletKind }) {
+  const [imageFailed, setImageFailed] = React.useState(false);
+  const src = WALLET_ICON_URLS[kind];
+
+  if (src && !imageFailed) {
+    return (
+      <span className="inline-flex h-5 w-5 items-center justify-center overflow-hidden rounded border border-white/20 bg-white/5">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={src}
+          alt={`${WALLET_LABELS[kind]} logo`}
+          className="h-4 w-4 object-contain"
+          loading="lazy"
+          onError={() => setImageFailed(true)}
+        />
+      </span>
+    );
+  }
+
   if (kind === "metamask") {
     return (
       <span className="inline-flex h-5 w-5 items-center justify-center rounded border border-orange-500/30 bg-orange-500/20 text-[10px] font-semibold text-orange-400">
@@ -25,7 +61,6 @@ function WalletLogo({ kind }: { kind: WalletKind }) {
       </span>
     );
   }
-
   if (kind === "rabby") {
     return (
       <span className="inline-flex h-5 w-5 items-center justify-center rounded border border-sky-500/30 bg-sky-500/20 text-[10px] font-semibold text-sky-400">
@@ -33,7 +68,6 @@ function WalletLogo({ kind }: { kind: WalletKind }) {
       </span>
     );
   }
-
   return (
     <span className="inline-flex h-5 w-5 items-center justify-center rounded border border-blue-500/30 bg-blue-500/20 text-[10px] font-semibold text-blue-400">
       WC
@@ -47,8 +81,27 @@ export function ConnectButton({ compact = false }: { compact?: boolean } = {}) {
   const { disconnect } = useDisconnect();
   const chainId = useChainId();
   const { switchChain, status: switchStatus, error: switchError } = useSwitchChain();
+  const autoSwitchAttemptedForChain = React.useRef<number | null>(null);
 
   const onSepolia = chainId === sepolia.id;
+
+  React.useEffect(() => {
+    if (!isConnected || !chainId) {
+      autoSwitchAttemptedForChain.current = null;
+      return;
+    }
+
+    if (chainId === sepolia.id) {
+      autoSwitchAttemptedForChain.current = null;
+      return;
+    }
+
+    if (switchStatus === "pending") return;
+    if (autoSwitchAttemptedForChain.current === chainId) return;
+
+    autoSwitchAttemptedForChain.current = chainId;
+    switchChain({ chainId: sepolia.id });
+  }, [isConnected, chainId, switchStatus, switchChain]);
 
   const walletOptions = React.useMemo(() => {
     const seen = new Set<string>();
@@ -108,7 +161,7 @@ export function ConnectButton({ compact = false }: { compact?: boolean } = {}) {
                   variant="outline"
                   className="w-full justify-between"
                   disabled={status === "pending"}
-                  onClick={() => connect({ connector })}
+                  onClick={() => connect({ connector, chainId: sepolia.id })}
                 >
                   <span className="inline-flex items-center gap-2">
                     <WalletLogo kind={kind} />
