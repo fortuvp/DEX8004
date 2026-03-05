@@ -4,7 +4,7 @@ import * as React from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { WagmiProvider, createConfig, http } from "wagmi";
 import { sepolia } from "wagmi/chains";
-import { injected, walletConnect } from "wagmi/connectors";
+import { injected, metaMask, walletConnect } from "wagmi/connectors";
 
 const queryClient = new QueryClient();
 
@@ -16,8 +16,8 @@ if (!sepoliaRpcUrl) {
 const wcProjectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID;
 
 const connectors = [
-  // MetaMask
-  injected({ target: "metaMask", shimDisconnect: true }),
+  // Dedicated MetaMask connector avoids provider collisions when multiple injected wallets are installed.
+  metaMask(),
 
   // Rabby
   injected({ target: "rabby", shimDisconnect: true }),
